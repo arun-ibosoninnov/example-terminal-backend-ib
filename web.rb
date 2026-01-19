@@ -4,6 +4,9 @@ require 'dotenv'
 require 'json'
 require 'sinatra/cross_origin'
 
+# Set the port from environment variable or default to 4567
+set :port, ENV['PORT'] ? ENV['PORT'].to_i : 4567
+
 # Browsers require that external servers enable CORS when the server is at a different origin than the website.
 # https://developer.mozilla.org/en-US/docs/Web/HTTP/CORS
 # This enables the requires CORS headers to allow the browser to make the requests from the JS Example App.

@@ -1,3 +1,7 @@
+# Prevent Sinatra from parsing command-line arguments that might cause issues
+# We'll configure the port and bind address directly in code
+ARGV.clear if ARGV.any?
+
 require 'sinatra'
 require 'stripe'
 require 'dotenv'
@@ -348,9 +352,4 @@ post '/create_location' do
   status 200
   content_type :json
   return location.to_json
-end
-
-# Start the server when this file is run directly
-if __FILE__ == $0
-  run!
 end

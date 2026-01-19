@@ -27,7 +27,9 @@ options "*" do
   200
 end
 
-Dotenv.load
+# Load .env file if it exists (for local development)
+Dotenv.load if File.exist?('.env')
+
 Stripe.api_key = ENV['STRIPE_ENV'] == 'production' ? ENV['STRIPE_SECRET_KEY'] : ENV['STRIPE_TEST_SECRET_KEY']
 Stripe.api_version = '2020-03-02'
 
@@ -346,4 +348,9 @@ post '/create_location' do
   status 200
   content_type :json
   return location.to_json
+end
+
+# Start the server when this file is run directly
+if __FILE__ == $0
+  run!
 end

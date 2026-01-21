@@ -132,6 +132,28 @@ post '/create_payment_intent' do
   end
 
   begin
+    # Create or look up Stripe Customer from email if provided
+    customer_id = nil
+    customer_email = params[:email] || params[:receipt_email]
+    if customer_email && !customer_email.empty?
+      begin
+        # Try to find existing customer by email
+        customer_list = Stripe::Customer.list(email: customer_email, limit: 1).data
+        if customer_list.length > 0
+          customer_id = customer_list[0].id
+          log_info("Found existing customer: #{customer_id}")
+        else
+          # Create new customer
+          customer = Stripe::Customer.create(email: customer_email)
+          customer_id = customer.id
+          log_info("Created new customer: #{customer_id}")
+        end
+      rescue Stripe::StripeError => e
+        log_info("Error creating/looking up customer: #{e.message}")
+        # Continue without customer if there's an error
+      end
+    end
+    
     payment_intent_params = {
       :payment_method_types => params[:payment_method_types] || ['card_present'],
       :capture_method => params[:capture_method] || 'manual',
@@ -139,8 +161,13 @@ post '/create_payment_intent' do
       :currency => params[:currency] || 'usd',
       :description => params[:description] || 'Example PaymentIntent',
       :payment_method_options => params[:payment_method_options] || [],
-      :receipt_email => params[:email] || params[:receipt_email],
+      :receipt_email => customer_email,
     }
+    
+    # Add customer if we have one
+    if customer_id
+      payment_intent_params[:customer] = customer_id
+    end
     
     # Add metadata if provided
     if params[:metadata] && !params[:metadata].empty?

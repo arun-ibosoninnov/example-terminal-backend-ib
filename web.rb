@@ -22,6 +22,22 @@ end
 
 before do
   response.headers['Access-Control-Allow-Origin'] = '*'
+  
+  # Parse JSON request body if Content-Type is application/json
+  if request.content_type && request.content_type.include?('application/json') && request.body.size > 0
+    request.body.rewind
+    body_content = request.body.read
+    if !body_content.empty?
+      begin
+        json_params = JSON.parse(body_content)
+        # Merge JSON params into params hash
+        json_params.each { |k, v| params[k.to_sym] = v }
+      rescue JSON::ParserError => e
+        # If JSON parsing fails, continue with existing params
+        log_info("Failed to parse JSON body: #{e.message}")
+      end
+    end
+  end
 end
 
 options "*" do
@@ -167,6 +183,10 @@ post '/create_payment_intent' do
     # Add customer if we have one
     if customer_id
       payment_intent_params[:customer] = customer_id
+      log_info("Adding customer to PaymentIntent: #{customer_id}")
+    else
+      payment_intent_params[:customer] = "no"
+      log_info("No customer ID available - email: #{customer_email}")
     end
     
     # Add metadata if provided
@@ -174,6 +194,7 @@ post '/create_payment_intent' do
       payment_intent_params[:metadata] = params[:metadata]
     end
     
+    log_info("Creating PaymentIntent with params: #{payment_intent_params.inspect}")
     payment_intent = Stripe::PaymentIntent.create(payment_intent_params)
     
     # Update description to only contain the PaymentIntent ID

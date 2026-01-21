@@ -22,22 +22,6 @@ end
 
 before do
   response.headers['Access-Control-Allow-Origin'] = '*'
-  
-  # Parse JSON request body if Content-Type is application/json
-  if request.content_type && request.content_type.include?('application/json') && request.body.size > 0
-    request.body.rewind
-    body_content = request.body.read
-    if !body_content.empty?
-      begin
-        json_params = JSON.parse(body_content)
-        # Merge JSON params into params hash
-        json_params.each { |k, v| params[k.to_sym] = v }
-      rescue JSON::ParserError => e
-        # If JSON parsing fails, continue with existing params
-        log_info("Failed to parse JSON body: #{e.message}")
-      end
-    end
-  end
 end
 
 options "*" do
@@ -412,80 +396,4 @@ post '/create_location' do
   status 200
   content_type :json
   return location.to_json
-end
-
-# This endpoint retrieves the current status of a PaymentIntent.
-# Useful for polling from the frontend to check Terminal payment status.
-# https://stripe.com/docs/api/payment_intents/retrieve
-get '/payment_intent/:id' do
-  validationError = validateApiKey
-  if !validationError.nil?
-    status 400
-    return log_info(validationError)
-  end
-
-  begin
-    payment_intent = Stripe::PaymentIntent.retrieve(params[:id])
-  rescue Stripe::StripeError => e
-    status 402
-    return log_info("Error retrieving PaymentIntent! #{e.message}")
-  end
-
-  status 200
-  content_type :json
-  return payment_intent.to_json
-end
-
-# This endpoint handles Stripe webhook events.
-# Configure this URL in your Stripe Dashboard: https://dashboard.stripe.com/webhooks
-# https://stripe.com/docs/webhooks
-post '/webhook' do
-  payload = request.body.read
-  sig_header = request.env['HTTP_STRIPE_SIGNATURE']
-  endpoint_secret = ENV['STRIPE_WEBHOOK_SECRET']
-
-  begin
-    event = Stripe::Webhook.construct_event(
-      payload, sig_header, endpoint_secret
-    )
-  rescue JSON::ParserError => e
-    log_info("Invalid payload: #{e.message}")
-    status 400
-    return "Invalid payload"
-  rescue Stripe::SignatureVerificationError => e
-    log_info("Invalid signature: #{e.message}")
-    status 400
-    return "Invalid signature"
-  end
-
-  # Handle the event
-  case event.type
-  when 'payment_intent.succeeded'
-    payment_intent = event.data.object
-    log_info("PaymentIntent succeeded: #{payment_intent.id}")
-    # You can add custom logic here, e.g., update your database, send notifications, etc.
-    
-  when 'payment_intent.payment_failed'
-    payment_intent = event.data.object
-    log_info("PaymentIntent failed: #{payment_intent.id}")
-    # Handle failed payment
-    
-  when 'charge.succeeded'
-    charge = event.data.object
-    log_info("Charge succeeded: #{charge.id}")
-    
-  when 'charge.captured'
-    charge = event.data.object
-    log_info("Charge captured: #{charge.id}")
-    
-  when 'payment_intent.amount_capturable_updated'
-    payment_intent = event.data.object
-    log_info("PaymentIntent amount_capturable updated: #{payment_intent.id}")
-    
-  else
-    log_info("Unhandled event type: #{event.type}")
-  end
-
-  status 200
-  return {:received => true}.to_json
 end

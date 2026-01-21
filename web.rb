@@ -148,6 +148,14 @@ post '/create_payment_intent' do
     end
     
     payment_intent = Stripe::PaymentIntent.create(payment_intent_params)
+    
+    # Update description to include the PaymentIntent ID
+    base_description = params[:description] || 'Example PaymentIntent'
+    updated_description = "#{base_description} - #{payment_intent.id}"
+    payment_intent = Stripe::PaymentIntent.update(
+      payment_intent.id,
+      description: updated_description
+    )
   rescue Stripe::StripeError => e
     status 402
     return log_info("Error creating PaymentIntent! #{e.message}")

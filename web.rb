@@ -22,22 +22,6 @@ end
 
 before do
   response.headers['Access-Control-Allow-Origin'] = '*'
-  
-  # Parse JSON request body if Content-Type is application/json
-  if request.content_type && request.content_type.include?('application/json') && request.body.size > 0
-    request.body.rewind
-    body_content = request.body.read
-    if !body_content.empty?
-      begin
-        json_params = JSON.parse(body_content)
-        # Merge JSON params into params hash
-        json_params.each { |k, v| params[k.to_sym] = v }
-      rescue JSON::ParserError => e
-        # If JSON parsing fails, continue with existing params
-        log_info("Failed to parse JSON body: #{e.message}")
-      end
-    end
-  end
 end
 
 options "*" do
@@ -140,6 +124,23 @@ end
 # The example backend does not currently support connected accounts.
 # To create a PaymentIntent for a connected account, see
 # https://stripe.com/docs/terminal/features/connect#direct-payment-intents-server-side
+# Looks up or creates a Customer on your stripe account with the provided email
+def lookupOrCreateCustomer(customerEmail)
+  return nil if customerEmail.nil? || customerEmail.empty?
+  
+  begin
+    customerList = Stripe::Customer.list(email: customerEmail, limit: 1).data
+    if (customerList.length == 1)
+      return customerList[0]
+    else
+      return Stripe::Customer.create(email: customerEmail)
+    end
+  rescue Stripe::StripeError => e
+    log_info("Error creating or retrieving customer! #{e.message}")
+    return nil
+  end
+end
+
 post '/create_payment_intent' do
   validationError = validateApiKey
   if !validationError.nil?
@@ -148,26 +149,13 @@ post '/create_payment_intent' do
   end
 
   begin
-    # Create or look up Stripe Customer from email if provided
-    customer_id = nil
+    # Get email from request
     customer_email = params[:email] || params[:receipt_email]
-    if customer_email && !customer_email.empty?
-      begin
-        # Try to find existing customer by email
-        customer_list = Stripe::Customer.list(email: customer_email, limit: 1).data
-        if customer_list.length > 0
-          customer_id = customer_list[0].id
-          log_info("Found existing customer: #{customer_id}")
-        else
-          # Create new customer
-          customer = Stripe::Customer.create(email: customer_email)
-          customer_id = customer.id
-          log_info("Created new customer: #{customer_id}")
-        end
-      rescue Stripe::StripeError => e
-        log_info("Error creating/looking up customer: #{e.message}")
-        # Continue without customer if there's an error
-      end
+    
+    # Look up or create Stripe Customer from email
+    customer = nil
+    if customer_email
+      customer = lookupOrCreateCustomer(customer_email)
     end
     
     payment_intent_params = {
@@ -181,12 +169,8 @@ post '/create_payment_intent' do
     }
     
     # Add customer if we have one
-    if customer_id
-      payment_intent_params[:customer] = customer_id
-      log_info("Adding customer to PaymentIntent: #{customer_id}")
-    else
-      payment_intent_params[:customer] = "no"
-      log_info("No customer ID available - email: #{customer_email}")
+    if customer
+      payment_intent_params[:customer] = customer.id
     end
     
     # Add metadata if provided
@@ -194,7 +178,6 @@ post '/create_payment_intent' do
       payment_intent_params[:metadata] = params[:metadata]
     end
     
-    log_info("Creating PaymentIntent with params: #{payment_intent_params.inspect}")
     payment_intent = Stripe::PaymentIntent.create(payment_intent_params)
     
     # Update description to only contain the PaymentIntent ID

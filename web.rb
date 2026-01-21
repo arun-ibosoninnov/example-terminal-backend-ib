@@ -139,7 +139,7 @@ post '/create_payment_intent' do
       :currency => params[:currency] || 'usd',
       :description => params[:description] || 'Example PaymentIntent',
       :payment_method_options => params[:payment_method_options] || [],
-      :receipt_email => params[:receipt_email],
+      :receipt_email => params[:email] || params[:receipt_email],
     }
     
     # Add metadata if provided

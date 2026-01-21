@@ -132,7 +132,7 @@ post '/create_payment_intent' do
   end
 
   begin
-    payment_intent = Stripe::PaymentIntent.create(
+    payment_intent_params = {
       :payment_method_types => params[:payment_method_types] || ['card_present'],
       :capture_method => params[:capture_method] || 'manual',
       :amount => params[:amount],
@@ -140,7 +140,14 @@ post '/create_payment_intent' do
       :description => params[:description] || 'Example PaymentIntent',
       :payment_method_options => params[:payment_method_options] || [],
       :receipt_email => params[:receipt_email],
-    )
+    }
+    
+    # Add metadata if provided
+    if params[:metadata] && !params[:metadata].empty?
+      payment_intent_params[:metadata] = params[:metadata]
+    end
+    
+    payment_intent = Stripe::PaymentIntent.create(payment_intent_params)
   rescue Stripe::StripeError => e
     status 402
     return log_info("Error creating PaymentIntent! #{e.message}")

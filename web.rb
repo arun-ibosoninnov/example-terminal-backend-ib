@@ -22,6 +22,17 @@ end
 
 before do
   response.headers['Access-Control-Allow-Origin'] = '*'
+  # Parse JSON body into params so both form-encoded and JSON POSTs work (e.g. pay immediately vs connect-then-pay)
+  if request.post? && request.media_type == 'application/json' && request.body
+    body = request.body.read
+    request.body.rewind
+    if !body.nil? && !body.empty?
+      parsed = JSON.parse(body) rescue nil
+      if parsed.is_a?(Hash)
+        parsed.each { |k, v| params[k.to_s] = v }
+      end
+    end
+  end
 end
 
 options "*" do
@@ -100,6 +111,8 @@ end
 # To create a ConnectionToken for a connected account, see
 # https://stripe.com/docs/terminal/features/connect#direct-connection-tokens
 post '/connection_token' do
+  log_info("connection_token requested (no params required)")
+
   validationError = validateApiKey
   if !validationError.nil?
     status 400
@@ -142,6 +155,9 @@ def lookupOrCreateCustomer(customerEmail)
 end
 
 post '/create_payment_intent' do
+  # Log incoming params to compare scenario 1 (pay immediately) vs scenario 2 (connect then pay)
+  log_info("create_payment_intent request params: amount=#{params[:amount]}, currency=#{params[:currency]}, email=#{params[:email]}, receipt_email=#{params[:receipt_email]}, description=#{params[:description]}, metadata=#{params[:metadata].inspect}, payment_method_types=#{params[:payment_method_types].inspect}")
+
   validationError = validateApiKey
   if !validationError.nil?
     status 400
@@ -198,6 +214,8 @@ end
 # This endpoint captures a PaymentIntent.
 # https://stripe.com/docs/terminal/payments#capture
 post '/capture_payment_intent' do
+  log_info("capture_payment_intent request params: payment_intent_id=#{params['payment_intent_id']}, amount_to_capture=#{params['amount_to_capture']}")
+
   begin
     id = params["payment_intent_id"]
     if !params["amount_to_capture"].nil?

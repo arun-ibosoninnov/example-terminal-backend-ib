@@ -8,6 +8,7 @@ require 'dotenv'
 require 'json'
 require 'sinatra/cross_origin'
 require 'rack/protection'
+require 'logger'
 
 # Set the port from environment variable or default to 4567
 # This ensures compatibility with Railway, Render, Heroku, and other platforms
@@ -67,9 +68,40 @@ options "*" do
   status 200
 end
 
+$logger = Logger.new(STDOUT)
+$logger.level = Logger::DEBUG
+$logger.formatter = proc do |severity, datetime, _progname, msg|
+  "[#{datetime.strftime('%Y-%m-%d %H:%M:%S')}] #{severity}: #{msg}\n"
+end
+
 def log_info(message)
-  puts "\n" + message + "\n\n"
+  $logger.info(message)
   return message
+end
+
+def log_error(message)
+  $logger.error(message)
+  return message
+end
+
+before do
+  @request_start = Time.now
+  request.body.rewind
+  body_content = request.body.read
+  request.body.rewind
+
+  $logger.info("--- INCOMING REQUEST ---")
+  $logger.info("Method: #{request.request_method} | Path: #{request.path_info}")
+  $logger.info("Params: #{params.reject { |k, _| k == 'splat' || k == 'captures' }.to_json}") unless params.empty?
+  $logger.info("Body: #{body_content}") unless body_content.empty?
+end
+
+after do
+  duration = ((Time.now - @request_start) * 1000).round(2) if @request_start
+  $logger.info("--- OUTGOING RESPONSE ---")
+  $logger.info("Status: #{response.status} | Duration: #{duration}ms")
+  $logger.info("Response Body: #{response.body.is_a?(Array) ? response.body.join : response.body}")
+  $logger.info("------------------------")
 end
 
 get '/' do
@@ -103,21 +135,7 @@ def validateApiKey
   return nil
 end
 
-# Fetches the first available Terminal Location from Stripe.
-# Returns the location object, or nil if none found.
-def fetch_first_location
-  begin
-    locations = Stripe::Terminal::Location.list(limit: 1)
-    return locations.data.first
-  rescue Stripe::StripeError => e
-    log_info("Error fetching locations! #{e.message}")
-    return nil
-  end
-end
-
 # This endpoint registers a Verifone P400 reader to your Stripe account.
-# If no location is provided, it automatically fetches the first available
-# Terminal Location from Stripe and uses it.
 # https://stripe.com/docs/terminal/readers/connecting/verifone-p400#register-reader
 post '/register_reader' do
   validationError = validateApiKey
@@ -126,30 +144,18 @@ post '/register_reader' do
     return log_info(validationError)
   end
 
-  # Use provided location or auto-fetch the first available one
-  location_id = params[:location]
-  if location_id.nil? || location_id.empty?
-    location = fetch_first_location
-    if location.nil?
-      status 400
-      return log_info("No location provided and no Terminal Locations found in your Stripe account. Please create a location first via POST /create_location.")
-    end
-    location_id = location.id
-    log_info("No location param provided — auto-using location: #{location_id} (#{location.display_name})")
-  end
-
   begin
     reader = Stripe::Terminal::Reader.create(
       :registration_code => params[:registration_code],
       :label => params[:label],
-      :location => location_id
+      :location => params[:location]
     )
   rescue Stripe::StripeError => e
     status 402
-    return log_info("Error registering reader! #{e.message}")
+    return log_error("Error registering reader! #{e.message}")
   end
 
-  log_info("Reader registered: #{reader.id} at location: #{location_id}")
+  log_info("Reader registered: #{reader.id}")
 
   status 200
   # Note that returning the Stripe reader object directly creates a dependency between your
@@ -179,7 +185,7 @@ post '/connection_token' do
     token = Stripe::Terminal::ConnectionToken.create
   rescue Stripe::StripeError => e
     status 402
-    return log_info("Error creating ConnectionToken! #{e.message}")
+    return log_error("Error creating ConnectionToken! #{e.message}")
   end
 
   content_type :json
@@ -205,7 +211,7 @@ def lookupOrCreateCustomer(customerEmail)
       return Stripe::Customer.create(email: customerEmail)
     end
   rescue Stripe::StripeError => e
-    log_info("Error creating or retrieving customer! #{e.message}")
+    log_error("Error creating or retrieving customer! #{e.message}")
     return nil
   end
 end
@@ -256,7 +262,7 @@ post '/create_payment_intent' do
     )
   rescue Stripe::StripeError => e
     status 402
-    return log_info("Error creating PaymentIntent! #{e.message}")
+    return log_error("Error creating PaymentIntent! #{e.message}")
   end
 
   log_info("PaymentIntent successfully created: #{payment_intent.id}")
@@ -276,7 +282,7 @@ post '/capture_payment_intent' do
     end
   rescue Stripe::StripeError => e
     status 402
-    return log_info("Error capturing PaymentIntent! #{e.message}")
+    return log_error("Error capturing PaymentIntent! #{e.message}")
   end
 
   log_info("PaymentIntent successfully captured: #{id}")
@@ -293,7 +299,7 @@ post '/cancel_payment_intent' do
     payment_intent = Stripe::PaymentIntent.cancel(id)
   rescue Stripe::StripeError => e
     status 402
-    return log_info("Error canceling PaymentIntent! #{e.message}")
+    return log_error("Error canceling PaymentIntent! #{e.message}")
   end
 
   log_info("PaymentIntent successfully canceled: #{id}")
@@ -332,7 +338,7 @@ post '/create_setup_intent' do
 
   rescue Stripe::StripeError => e
     status 402
-    return log_info("Error creating SetupIntent! #{e.message}")
+    return log_error("Error creating SetupIntent! #{e.message}")
   end
 
   log_info("SetupIntent successfully created: #{setup_intent.id}")
@@ -353,7 +359,7 @@ def lookupOrCreateExampleCustomer
     end
   rescue Stripe::StripeError => e
     status 402
-    return log_info("Error creating or retreiving customer! #{e.message}")
+    return log_error("Error creating or retrieving customer! #{e.message}")
   end
 end
 
@@ -371,7 +377,7 @@ post '/attach_payment_method_to_customer' do
     })
   rescue Stripe::StripeError => e
     status 402
-    return log_info("Error attaching PaymentMethod to Customer! #{e.message}")
+    return log_error("Error attaching PaymentMethod to Customer! #{e.message}")
   end
 
   log_info("Attached PaymentMethod to Customer: #{customer.id}")
@@ -407,7 +413,7 @@ post '/update_payment_intent' do
     log_info("Updated PaymentIntent #{payment_intent_id}")
   rescue Stripe::StripeError => e
     status 402
-    return log_info("Error updating PaymentIntent #{payment_intent_id}. #{e.message}")
+    return log_error("Error updating PaymentIntent #{payment_intent_id}. #{e.message}")
   end
 
   status 200
@@ -431,7 +437,7 @@ get '/list_locations' do
     )
   rescue Stripe::StripeError => e
     status 402
-    return log_info("Error fetching Locations! #{e.message}")
+    return log_error("Error fetching Locations! #{e.message}")
   end
 
   log_info("#{locations.data.size} Locations successfully fetched")
@@ -457,7 +463,7 @@ post '/create_location' do
     )
   rescue Stripe::StripeError => e
     status 402
-    return log_info("Error creating Location! #{e.message}")
+    return log_error("Error creating Location! #{e.message}")
   end
 
   log_info("Location successfully created: #{location.id}")

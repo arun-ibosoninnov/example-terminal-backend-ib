@@ -103,7 +103,21 @@ def validateApiKey
   return nil
 end
 
+# Fetches the first available Terminal Location from Stripe.
+# Returns the location object, or nil if none found.
+def fetch_first_location
+  begin
+    locations = Stripe::Terminal::Location.list(limit: 1)
+    return locations.data.first
+  rescue Stripe::StripeError => e
+    log_info("Error fetching locations! #{e.message}")
+    return nil
+  end
+end
+
 # This endpoint registers a Verifone P400 reader to your Stripe account.
+# If no location is provided, it automatically fetches the first available
+# Terminal Location from Stripe and uses it.
 # https://stripe.com/docs/terminal/readers/connecting/verifone-p400#register-reader
 post '/register_reader' do
   validationError = validateApiKey
@@ -112,18 +126,30 @@ post '/register_reader' do
     return log_info(validationError)
   end
 
+  # Use provided location or auto-fetch the first available one
+  location_id = params[:location]
+  if location_id.nil? || location_id.empty?
+    location = fetch_first_location
+    if location.nil?
+      status 400
+      return log_info("No location provided and no Terminal Locations found in your Stripe account. Please create a location first via POST /create_location.")
+    end
+    location_id = location.id
+    log_info("No location param provided — auto-using location: #{location_id} (#{location.display_name})")
+  end
+
   begin
     reader = Stripe::Terminal::Reader.create(
       :registration_code => params[:registration_code],
       :label => params[:label],
-      :location => params[:location]
+      :location => location_id
     )
   rescue Stripe::StripeError => e
     status 402
     return log_info("Error registering reader! #{e.message}")
   end
 
-  log_info("Reader registered: #{reader.id}")
+  log_info("Reader registered: #{reader.id} at location: #{location_id}")
 
   status 200
   # Note that returning the Stripe reader object directly creates a dependency between your

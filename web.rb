@@ -7,6 +7,8 @@ require 'stripe'
 require 'dotenv'
 require 'json'
 require 'sinatra/cross_origin'
+require 'net/http'
+require 'uri'
 
 # Set the port from environment variable or default to 4567
 # This ensures compatibility with Railway, Render, Heroku, and other platforms
@@ -107,6 +109,10 @@ end
 # https://stripe.com/docs/terminal/sdk/ios#connection-token
 # https://stripe.com/docs/terminal/sdk/android#connection-token
 #
+# CLIENT FLOW: The app must wait for the terminal to be CONNECTED (after using
+# this token) before calling /create_payment_intent or collecting payment.
+# Otherwise "connect and pay in one go" can fail; connect first, then pay.
+#
 # The example backend does not currently support connected accounts.
 # To create a ConnectionToken for a connected account, see
 # https://stripe.com/docs/terminal/features/connect#direct-connection-tokens
@@ -154,14 +160,67 @@ def lookupOrCreateCustomer(customerEmail)
   end
 end
 
+# Carwash API base URL (e.g. https://carwashdev.way.com or set CARWASH_API_BASE_URL in env)
+CARWASH_API_BASE = ENV['CARWASH_API_BASE_URL'] || 'https://carwashdev.way.com'
+
+# Calls carwash API GET /api/location/view-location/:location_id with Bearer token.
+# Returns [success, data_or_error_message].
+def fetch_carwash_location(token, location_id)
+  return [false, 'missing token'] if token.nil? || token.to_s.empty?
+  return [false, 'missing location_id'] if location_id.nil? || location_id.to_s.empty?
+
+  path = "/api/location/view-location/#{location_id}"
+  url = URI.parse("#{CARWASH_API_BASE}#{path}")
+  http = Net::HTTP.new(url.host, url.port)
+  http.use_ssl = (url.scheme == 'https')
+  request = Net::HTTP::Get.new(url.request_uri)
+  request['Authorization'] = "Bearer #{token}"
+
+  response = http.request(request)
+  body = response.body
+  log_info("carwash location API: #{response.code} #{path} -> #{body[0..200]}")
+
+  unless response.is_a?(Net::HTTPSuccess)
+    return [false, "carwash API error: #{response.code} #{body[0..500]}"]
+  end
+
+  data = JSON.parse(body) rescue nil
+  unless data.is_a?(Hash) && data['status'] == true
+    return [false, data.is_a?(Hash) ? (data['message'] || 'location not found') : 'invalid response']
+  end
+
+  [true, data['data']]
+end
+
 post '/create_payment_intent' do
   # Log incoming params to compare scenario 1 (pay immediately) vs scenario 2 (connect then pay)
-  log_info("create_payment_intent request params: amount=#{params[:amount]}, currency=#{params[:currency]}, email=#{params[:email]}, receipt_email=#{params[:receipt_email]}, description=#{params[:description]}, metadata=#{params[:metadata].inspect}, payment_method_types=#{params[:payment_method_types].inspect}")
+  log_info("create_payment_intent request params: amount=#{params[:amount]}, currency=#{params[:currency]}, email=#{params[:email]}, receipt_email=#{params[:receipt_email]}, description=#{params[:description]}, metadata=#{params[:metadata].inspect}, payment_method_types=#{params[:payment_method_types].inspect}, token=#{params[:token].nil? ? 'nil' : '[present]'}")
 
   validationError = validateApiKey
   if !validationError.nil?
     status 400
     return log_info(validationError)
+  end
+
+  # Token is sent as plain top-level form field (token=<jwt>); use it to authorize with carwash API
+  token = params[:token] || params['token']
+  location_id = params[:location_id] || params['location_id']
+  if location_id.nil? && params[:metadata]
+    meta = params[:metadata]
+    location_id = (meta.is_a?(Hash) && (meta['location_id'] || meta[:location_id])) || nil
+  end
+  if location_id.nil? && params['metadata']
+    meta = params['metadata']
+    location_id = (meta.is_a?(Hash) && (meta['location_id'] || meta[:location_id])) || nil
+  end
+
+  if token && location_id
+    ok, result = fetch_carwash_location(token, location_id)
+    unless ok
+      status 401
+      return log_info("create_payment_intent: carwash location check failed - #{result}")
+    end
+    log_info("create_payment_intent: carwash location validated for location_id=#{location_id}")
   end
 
   begin

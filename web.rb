@@ -6,9 +6,10 @@ require 'sinatra'
 require 'stripe'
 require 'dotenv'
 require 'json'
+require 'uri'
+require 'net/http'
 require 'sinatra/cross_origin'
 require 'rack/protection'
-require 'logger'
 
 # Set the port from environment variable or default to 4567
 # This ensures compatibility with Railway, Render, Heroku, and other platforms
@@ -68,40 +69,9 @@ options "*" do
   status 200
 end
 
-$logger = Logger.new(STDOUT)
-$logger.level = Logger::DEBUG
-$logger.formatter = proc do |severity, datetime, _progname, msg|
-  "[#{datetime.strftime('%Y-%m-%d %H:%M:%S')}] #{severity}: #{msg}\n"
-end
-
 def log_info(message)
-  $logger.info(message)
+  puts "\n" + message + "\n\n"
   return message
-end
-
-def log_error(message)
-  $logger.error(message)
-  return message
-end
-
-before do
-  @request_start = Time.now
-  request.body.rewind
-  body_content = request.body.read
-  request.body.rewind
-
-  $logger.info("--- INCOMING REQUEST ---")
-  $logger.info("Method: #{request.request_method} | Path: #{request.path_info}")
-  $logger.info("Params: #{params.reject { |k, _| k == 'splat' || k == 'captures' }.to_json}") unless params.empty?
-  $logger.info("Body: #{body_content}") unless body_content.empty?
-end
-
-after do
-  duration = ((Time.now - @request_start) * 1000).round(2) if @request_start
-  $logger.info("--- OUTGOING RESPONSE ---")
-  $logger.info("Status: #{response.status} | Duration: #{duration}ms")
-  $logger.info("Response Body: #{response.body.is_a?(Array) ? response.body.join : response.body}")
-  $logger.info("------------------------")
 end
 
 get '/' do
@@ -152,7 +122,7 @@ post '/register_reader' do
     )
   rescue Stripe::StripeError => e
     status 402
-    return log_error("Error registering reader! #{e.message}")
+    return log_info("Error registering reader! #{e.message}")
   end
 
   log_info("Reader registered: #{reader.id}")
@@ -185,7 +155,7 @@ post '/connection_token' do
     token = Stripe::Terminal::ConnectionToken.create
   rescue Stripe::StripeError => e
     status 402
-    return log_error("Error creating ConnectionToken! #{e.message}")
+    return log_info("Error creating ConnectionToken! #{e.message}")
   end
 
   content_type :json
@@ -199,7 +169,24 @@ end
 # The example backend does not currently support connected accounts.
 # To create a PaymentIntent for a connected account, see
 # https://stripe.com/docs/terminal/features/connect#direct-payment-intents-server-side
-# Looks up or creates a Customer on your stripe account with the provided email
+def fetch_way_location(location_id, token)
+  url = URI("https://carwashdev.way.com/api/location/view-location/#{location_id}")
+  https = Net::HTTP.new(url.host, url.port)
+  https.use_ssl = true
+
+  request = Net::HTTP::Get.new(url)
+  request["Authorization"] = "Bearer #{token}"
+
+  response = https.request(request)
+  body = response.read_body
+
+  log_info("Way.com location API response [HTTP #{response.code}]: #{body}")
+  { code: response.code.to_i, body: body }
+rescue StandardError => e
+  log_info("Error calling Way.com location API: #{e.message}")
+  { code: 500, body: e.message }
+end
+
 def lookupOrCreateCustomer(customerEmail)
   return nil if customerEmail.nil? || customerEmail.empty?
   
@@ -211,7 +198,7 @@ def lookupOrCreateCustomer(customerEmail)
       return Stripe::Customer.create(email: customerEmail)
     end
   rescue Stripe::StripeError => e
-    log_error("Error creating or retrieving customer! #{e.message}")
+    log_info("Error creating or retrieving customer! #{e.message}")
     return nil
   end
 end
@@ -221,6 +208,18 @@ post '/create_payment_intent' do
   if !validationError.nil?
     status 400
     return log_info(validationError)
+  end
+
+  jwt_token = params[:token]
+  location_id = params[:location_id]
+
+  if jwt_token && location_id
+    way_result = fetch_way_location(location_id, jwt_token)
+    log_info("Way.com lookup for location #{location_id}: HTTP #{way_result[:code]}")
+  elsif jwt_token.nil?
+    log_info("No token provided in create_payment_intent request — skipping Way.com lookup")
+  elsif location_id.nil?
+    log_info("No location_id provided in create_payment_intent request — skipping Way.com lookup")
   end
 
   begin
@@ -262,7 +261,7 @@ post '/create_payment_intent' do
     )
   rescue Stripe::StripeError => e
     status 402
-    return log_error("Error creating PaymentIntent! #{e.message}")
+    return log_info("Error creating PaymentIntent! #{e.message}")
   end
 
   log_info("PaymentIntent successfully created: #{payment_intent.id}")
@@ -282,7 +281,7 @@ post '/capture_payment_intent' do
     end
   rescue Stripe::StripeError => e
     status 402
-    return log_error("Error capturing PaymentIntent! #{e.message}")
+    return log_info("Error capturing PaymentIntent! #{e.message}")
   end
 
   log_info("PaymentIntent successfully captured: #{id}")
@@ -299,7 +298,7 @@ post '/cancel_payment_intent' do
     payment_intent = Stripe::PaymentIntent.cancel(id)
   rescue Stripe::StripeError => e
     status 402
-    return log_error("Error canceling PaymentIntent! #{e.message}")
+    return log_info("Error canceling PaymentIntent! #{e.message}")
   end
 
   log_info("PaymentIntent successfully canceled: #{id}")
@@ -338,7 +337,7 @@ post '/create_setup_intent' do
 
   rescue Stripe::StripeError => e
     status 402
-    return log_error("Error creating SetupIntent! #{e.message}")
+    return log_info("Error creating SetupIntent! #{e.message}")
   end
 
   log_info("SetupIntent successfully created: #{setup_intent.id}")
@@ -359,7 +358,7 @@ def lookupOrCreateExampleCustomer
     end
   rescue Stripe::StripeError => e
     status 402
-    return log_error("Error creating or retrieving customer! #{e.message}")
+    return log_info("Error creating or retreiving customer! #{e.message}")
   end
 end
 
@@ -377,7 +376,7 @@ post '/attach_payment_method_to_customer' do
     })
   rescue Stripe::StripeError => e
     status 402
-    return log_error("Error attaching PaymentMethod to Customer! #{e.message}")
+    return log_info("Error attaching PaymentMethod to Customer! #{e.message}")
   end
 
   log_info("Attached PaymentMethod to Customer: #{customer.id}")
@@ -413,7 +412,7 @@ post '/update_payment_intent' do
     log_info("Updated PaymentIntent #{payment_intent_id}")
   rescue Stripe::StripeError => e
     status 402
-    return log_error("Error updating PaymentIntent #{payment_intent_id}. #{e.message}")
+    return log_info("Error updating PaymentIntent #{payment_intent_id}. #{e.message}")
   end
 
   status 200
@@ -437,7 +436,7 @@ get '/list_locations' do
     )
   rescue Stripe::StripeError => e
     status 402
-    return log_error("Error fetching Locations! #{e.message}")
+    return log_info("Error fetching Locations! #{e.message}")
   end
 
   log_info("#{locations.data.size} Locations successfully fetched")
@@ -463,7 +462,7 @@ post '/create_location' do
     )
   rescue Stripe::StripeError => e
     status 402
-    return log_error("Error creating Location! #{e.message}")
+    return log_info("Error creating Location! #{e.message}")
   end
 
   log_info("Location successfully created: #{location.id}")

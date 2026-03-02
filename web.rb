@@ -53,6 +53,16 @@ before do
   response.headers['Access-Control-Allow-Headers'] = 'Authorization, Content-Type, Accept'
   response.headers['Access-Control-Max-Age'] = '3600'
   
+  # Parse JSON request bodies into params so fields like token/location_id are accessible
+  if request.content_type&.include?('application/json')
+    body = request.body.read
+    unless body.empty?
+      json_params = JSON.parse(body, symbolize_names: false)
+      json_params.each { |k, v| params[k] = v }
+    end
+    request.body.rewind
+  end
+
   # Security headers
   response.headers['X-Content-Type-Options'] = 'nosniff'
   response.headers['X-Frame-Options'] = 'DENY'
@@ -210,8 +220,12 @@ post '/create_payment_intent' do
     return log_info(validationError)
   end
 
-  jwt_token = params[:token]
-  location_id = params[:location_id]
+  log_info("create_payment_intent — raw params received: #{params.inspect}")
+
+  jwt_token = params[:token] || params['token']
+  location_id = params[:location_id] || params['location_id']
+
+  log_info("create_payment_intent — token present: #{!jwt_token.nil?}, location_id: #{location_id.inspect}")
 
   if jwt_token && location_id
     way_result = fetch_way_location(location_id, jwt_token)

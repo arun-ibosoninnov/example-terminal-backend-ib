@@ -8,4 +8,4 @@ COPY . .
 RUN bundle install
 EXPOSE 4567
 
-ENTRYPOINT ["ruby", "web.rb", "-o", "0.0.0.0"]
+ENTRYPOINT ["/www/example-terminal-backend/entrypoint.sh"]

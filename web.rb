@@ -7,33 +7,56 @@ require 'stripe'
 require 'dotenv'
 require 'json'
 require 'sinatra/cross_origin'
-require 'net/http'
-require 'uri'
+require 'rack/protection'
 
 # Set the port from environment variable or default to 4567
 # This ensures compatibility with Railway, Render, Heroku, and other platforms
 set :port, ENV['PORT'] ? ENV['PORT'].to_i : 4567
 set :bind, '0.0.0.0'
 
-# Browsers require that external servers enable CORS when the server is at a different origin than the website.
-# https://developer.mozilla.org/en-US/docs/Web/HTTP/CORS
-# This enables the requires CORS headers to allow the browser to make the requests from the JS Example App.
-configure do
-  enable :cross_origin
+# Load environment variables
+# Load .env file if it exists (for local development)
+Dotenv.load if File.exist?('.env')
+
+# Production/Environment Configuration
+PRODUCTION = ENV['RACK_ENV'] == 'production' || ENV['ENVIRONMENT'] == 'production'
+STRIPE_ENV = ENV['STRIPE_ENV'] || (PRODUCTION ? 'production' : 'test')
+
+# Stripe Configuration
+if STRIPE_ENV == 'production'
+  Stripe.api_key = ENV['STRIPE_SECRET_KEY'] || ENV['STRIPE_LIVE_SECRET_KEY']
+else
+  Stripe.api_key = ENV['STRIPE_TEST_SECRET_KEY']
+end
+Stripe.api_version = '2020-03-02'
+
+# Production Configuration Validation
+if PRODUCTION
+  if Stripe.api_key.nil? || Stripe.api_key.empty? || !Stripe.api_key.start_with?('sk_live')
+    puts "\n⚠️  WARNING: STRIPE_SECRET_KEY should be set to your live key (sk_live_...) in production!\n\n"
+  end
 end
 
+# Security: Enable protection against common attacks
+configure do
+  enable :cross_origin
+  enable :sessions
+  set :protection, :except => [:json_csrf] # CORS handles cross-origin for API
+end
+
+# CORS Configuration - Allow all origins
 before do
   response.headers['Access-Control-Allow-Origin'] = '*'
-  # Parse JSON body into params so both form-encoded and JSON POSTs work (e.g. pay immediately vs connect-then-pay)
-  if request.post? && request.media_type == 'application/json' && request.body
-    body = request.body.read
-    request.body.rewind
-    if !body.nil? && !body.empty?
-      parsed = JSON.parse(body) rescue nil
-      if parsed.is_a?(Hash)
-        parsed.each { |k, v| params[k.to_s] = v }
-      end
-    end
+  response.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
+  response.headers['Access-Control-Allow-Headers'] = 'Authorization, Content-Type, Accept'
+  response.headers['Access-Control-Max-Age'] = '3600'
+  
+  # Security headers
+  response.headers['X-Content-Type-Options'] = 'nosniff'
+  response.headers['X-Frame-Options'] = 'DENY'
+  response.headers['X-XSS-Protection'] = '1; mode=block'
+  if PRODUCTION
+    response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
   end
 end
 
@@ -41,14 +64,8 @@ options "*" do
   response.headers["Allow"] = "GET, POST, OPTIONS"
   response.headers["Access-Control-Allow-Headers"] = "Authorization, Content-Type, Accept, X-User-Email, X-Auth-Token"
   response.headers["Access-Control-Allow-Origin"] = "*"
-  200
+  status 200
 end
-
-# Load .env file if it exists (for local development)
-Dotenv.load if File.exist?('.env')
-
-Stripe.api_key = ENV['STRIPE_ENV'] == 'production' ? ENV['STRIPE_SECRET_KEY'] : ENV['STRIPE_TEST_SECRET_KEY']
-Stripe.api_version = '2020-03-02'
 
 def log_info(message)
   puts "\n" + message + "\n\n"
@@ -56,19 +73,32 @@ def log_info(message)
 end
 
 get '/' do
-  status 200
-  send_file 'index.html'
+  status 404
+  content_type :json
+  {:error => 'Not Found', :message => 'This service is not available.'}.to_json
 end
 
 def validateApiKey
   if Stripe.api_key.nil? || Stripe.api_key.empty?
-    return "Error: you provided an empty secret key. Please provide your test mode secret key. For more information, see https://stripe.com/docs/keys"
+    mode = STRIPE_ENV == 'production' ? 'production' : 'test'
+    return "Error: you provided an empty secret key. Please provide your #{mode} mode secret key. For more information, see https://stripe.com/docs/keys"
   end
   if Stripe.api_key.start_with?('pk')
-    return "Error: you used a publishable key to set up the example backend. Please use your test mode secret key. For more information, see https://stripe.com/docs/keys"
+    return "Error: you used a publishable key to set up the backend. Please use your secret key. For more information, see https://stripe.com/docs/keys"
   end
-  if Stripe.api_key.start_with?('sk_live')
-    return "Error: you used a live mode secret key to set up the example backend. Please use your test mode secret key. For more information, see https://stripe.com/docs/keys#test-live-modes"
+  # Production validation: ensure key matches environment
+  if STRIPE_ENV == 'production'
+    unless Stripe.api_key.start_with?('sk_live')
+      return "Error: you are in production mode but using a test key. Please use your live mode secret key (sk_live_...). For more information, see https://stripe.com/docs/keys#test-live-modes"
+    end
+  else
+    # Test mode: ensure key matches environment
+    if Stripe.api_key.start_with?('sk_live')
+      return "Error: you are in test mode but using a live key. Please use your test mode secret key (sk_test_...). For more information, see https://stripe.com/docs/keys#test-live-modes"
+    end
+    unless Stripe.api_key.start_with?('sk_test')
+      return "Error: invalid secret key format. Please use your test mode secret key (sk_test_...). For more information, see https://stripe.com/docs/keys"
+    end
   end
   return nil
 end
@@ -109,16 +139,10 @@ end
 # https://stripe.com/docs/terminal/sdk/ios#connection-token
 # https://stripe.com/docs/terminal/sdk/android#connection-token
 #
-# CLIENT FLOW: The app must wait for the terminal to be CONNECTED (after using
-# this token) before calling /create_payment_intent or collecting payment.
-# Otherwise "connect and pay in one go" can fail; connect first, then pay.
-#
 # The example backend does not currently support connected accounts.
 # To create a ConnectionToken for a connected account, see
 # https://stripe.com/docs/terminal/features/connect#direct-connection-tokens
 post '/connection_token' do
-  log_info("connection_token requested (no params required)")
-
   validationError = validateApiKey
   if !validationError.nil?
     status 400
@@ -160,67 +184,11 @@ def lookupOrCreateCustomer(customerEmail)
   end
 end
 
-# Carwash API base URL (e.g. https://carwashdev.way.com or set CARWASH_API_BASE_URL in env)
-CARWASH_API_BASE = ENV['CARWASH_API_BASE_URL'] || 'https://carwashdev.way.com'
-
-# Calls carwash API GET /api/location/view-location/:location_id with Bearer token.
-# Returns [success, data_or_error_message].
-def fetch_carwash_location(token, location_id)
-  return [false, 'missing token'] if token.nil? || token.to_s.empty?
-  return [false, 'missing location_id'] if location_id.nil? || location_id.to_s.empty?
-
-  path = "/api/location/view-location/#{location_id}"
-  url = URI.parse("#{CARWASH_API_BASE}#{path}")
-  http = Net::HTTP.new(url.host, url.port)
-  http.use_ssl = (url.scheme == 'https')
-  request = Net::HTTP::Get.new(url.request_uri)
-  request['Authorization'] = "Bearer #{token}"
-
-  response = http.request(request)
-  body = response.body
-  log_info("carwash location API: #{response.code} #{path} -> #{body[0..200]}")
-
-  unless response.is_a?(Net::HTTPSuccess)
-    return [false, "carwash API error: #{response.code} #{body[0..500]}"]
-  end
-
-  data = JSON.parse(body) rescue nil
-  unless data.is_a?(Hash) && data['status'] == true
-    return [false, data.is_a?(Hash) ? (data['message'] || 'location not found') : 'invalid response']
-  end
-
-  [true, data['data']]
-end
-
 post '/create_payment_intent' do
-  # Log incoming params to compare scenario 1 (pay immediately) vs scenario 2 (connect then pay)
-  log_info("create_payment_intent request params: amount=#{params[:amount]}, currency=#{params[:currency]}, email=#{params[:email]}, receipt_email=#{params[:receipt_email]}, description=#{params[:description]}, metadata=#{params[:metadata].inspect}, payment_method_types=#{params[:payment_method_types].inspect}, token=#{params[:token].nil? ? 'nil' : '[present]'}")
-
   validationError = validateApiKey
   if !validationError.nil?
     status 400
     return log_info(validationError)
-  end
-
-  # Token is sent as plain top-level form field (token=<jwt>); use it to authorize with carwash API
-  token = params[:token] || params['token']
-  location_id = params[:location_id] || params['location_id']
-  if location_id.nil? && params[:metadata]
-    meta = params[:metadata]
-    location_id = (meta.is_a?(Hash) && (meta['location_id'] || meta[:location_id])) || nil
-  end
-  if location_id.nil? && params['metadata']
-    meta = params['metadata']
-    location_id = (meta.is_a?(Hash) && (meta['location_id'] || meta[:location_id])) || nil
-  end
-
-  if token && location_id
-    ok, result = fetch_carwash_location(token, location_id)
-    unless ok
-      status 401
-      return log_info("create_payment_intent: carwash location check failed - #{result}")
-    end
-    log_info("create_payment_intent: carwash location validated for location_id=#{location_id}")
   end
 
   begin
@@ -273,8 +241,6 @@ end
 # This endpoint captures a PaymentIntent.
 # https://stripe.com/docs/terminal/payments#capture
 post '/capture_payment_intent' do
-  log_info("capture_payment_intent request params: payment_intent_id=#{params['payment_intent_id']}, amount_to_capture=#{params['amount_to_capture']}")
-
   begin
     id = params["payment_intent_id"]
     if !params["amount_to_capture"].nil?

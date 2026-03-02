@@ -223,13 +223,25 @@ post '/create_payment_intent' do
   log_info("create_payment_intent — raw params received: #{params.inspect}")
 
   jwt_token = params[:token] || params['token']
-  location_id = params[:location_id] || params['location_id']
+  metadata = params[:metadata] || params['metadata'] || {}
+  location_id = metadata['location_id'] || metadata[:location_id]
+  stripe_account_id = nil
 
   log_info("create_payment_intent — token present: #{!jwt_token.nil?}, location_id: #{location_id.inspect}")
 
   if jwt_token && location_id
     way_result = fetch_way_location(location_id, jwt_token)
     log_info("Way.com lookup for location #{location_id}: HTTP #{way_result[:code]}")
+
+    if way_result[:code] == 200
+      begin
+        way_data = JSON.parse(way_result[:body])
+        stripe_account_id = way_data.dig('data', 'stripe_account_id')
+        log_info("Way.com returned stripe_account_id: #{stripe_account_id.inspect}")
+      rescue JSON::ParserError => e
+        log_info("Failed to parse Way.com response: #{e.message}")
+      end
+    end
   elsif jwt_token.nil?
     log_info("No token provided in create_payment_intent request — skipping Way.com lookup")
   elsif location_id.nil?
@@ -262,16 +274,24 @@ post '/create_payment_intent' do
     end
     
     # Add metadata if provided
-    if params[:metadata] && !params[:metadata].empty?
-      payment_intent_params[:metadata] = params[:metadata]
+    if metadata && !metadata.empty?
+      payment_intent_params[:metadata] = metadata
     end
     
-    payment_intent = Stripe::PaymentIntent.create(payment_intent_params)
+    # Create the PaymentIntent on the connected account if stripe_account_id was resolved
+    if stripe_account_id
+      log_info("Creating PaymentIntent on connected account: #{stripe_account_id}")
+      payment_intent = Stripe::PaymentIntent.create(payment_intent_params, { stripe_account: stripe_account_id })
+    else
+      payment_intent = Stripe::PaymentIntent.create(payment_intent_params)
+    end
     
     # Update description to only contain the PaymentIntent ID
+    update_opts = stripe_account_id ? { stripe_account: stripe_account_id } : {}
     payment_intent = Stripe::PaymentIntent.update(
       payment_intent.id,
-      description: payment_intent.id
+      { description: payment_intent.id },
+      update_opts
     )
   rescue Stripe::StripeError => e
     status 402

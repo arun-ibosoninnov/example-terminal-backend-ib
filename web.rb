@@ -220,12 +220,6 @@ post '/create_payment_intent' do
     if params[:metadata] && !params[:metadata].empty?
       payment_intent_params[:metadata] = params[:metadata]
     end
-
-    # If stripe_payment_intent_id is provided in metadata, add transfer_data
-    stripe_payment_intent_id = params[:metadata] && params[:metadata]['stripe_payment_intent_id']
-    if stripe_payment_intent_id && !stripe_payment_intent_id.empty?
-      payment_intent_params[:transfer_data] = { destination: stripe_payment_intent_id }
-    end
     
     payment_intent = Stripe::PaymentIntent.create(payment_intent_params)
     

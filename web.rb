@@ -6,8 +6,6 @@ require 'sinatra'
 require 'stripe'
 require 'dotenv'
 require 'json'
-require 'uri'
-require 'net/http'
 require 'sinatra/cross_origin'
 require 'rack/protection'
 
@@ -53,16 +51,6 @@ before do
   response.headers['Access-Control-Allow-Headers'] = 'Authorization, Content-Type, Accept'
   response.headers['Access-Control-Max-Age'] = '3600'
   
-  # Parse JSON request bodies into params so fields like token/location_id are accessible
-  if request.content_type&.include?('application/json')
-    body = request.body.read
-    unless body.empty?
-      json_params = JSON.parse(body, symbolize_names: false)
-      json_params.each { |k, v| params[k] = v }
-    end
-    request.body.rewind
-  end
-
   # Security headers
   response.headers['X-Content-Type-Options'] = 'nosniff'
   response.headers['X-Frame-Options'] = 'DENY'
@@ -179,30 +167,7 @@ end
 # The example backend does not currently support connected accounts.
 # To create a PaymentIntent for a connected account, see
 # https://stripe.com/docs/terminal/features/connect#direct-payment-intents-server-side
-def fetch_way_location(location_id, token)
-  url = URI("https://carwashdev.way.com/api/location/view-location/#{location_id}")
-  https = Net::HTTP.new(url.host, url.port)
-  https.use_ssl = true
-  https.open_timeout = 10
-  https.read_timeout = 10
-
-  request = Net::HTTP::Get.new(url)
-  request["Authorization"] = "Bearer #{token}"
-  request["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-  request["Accept"] = "application/json, text/plain, */*"
-  request["Accept-Language"] = "en-US,en;q=0.9"
-  request["Connection"] = "keep-alive"
-
-  response = https.request(request)
-  body = response.read_body
-
-  log_info("Way.com location API response [HTTP #{response.code}]: #{body}")
-  { code: response.code.to_i, body: body }
-rescue StandardError => e
-  log_info("Error calling Way.com location API: #{e.message}")
-  { code: 500, body: e.message }
-end
-
+# Looks up or creates a Customer on your stripe account with the provided email
 def lookupOrCreateCustomer(customerEmail)
   return nil if customerEmail.nil? || customerEmail.empty?
   
@@ -224,34 +189,6 @@ post '/create_payment_intent' do
   if !validationError.nil?
     status 400
     return log_info(validationError)
-  end
-
-  log_info("create_payment_intent — raw params received: #{params.inspect}")
-
-  jwt_token = params[:token] || params['token']
-  metadata = params[:metadata] || params['metadata'] || {}
-  location_id = metadata['location_id'] || metadata[:location_id]
-  stripe_account_id = nil
-
-  log_info("create_payment_intent — token present: #{!jwt_token.nil?}, location_id: #{location_id.inspect}")
-
-  if jwt_token && location_id
-    way_result = fetch_way_location(location_id, jwt_token)
-    log_info("Way.com lookup for location #{location_id}: HTTP #{way_result[:code]}")
-
-    if way_result[:code] == 200
-      begin
-        way_data = JSON.parse(way_result[:body])
-        stripe_account_id = way_data.dig('data', 'stripe_account_id')
-        log_info("Way.com returned stripe_account_id: #{stripe_account_id.inspect}")
-      rescue JSON::ParserError => e
-        log_info("Failed to parse Way.com response: #{e.message}")
-      end
-    end
-  elsif jwt_token.nil?
-    log_info("No token provided in create_payment_intent request — skipping Way.com lookup")
-  elsif location_id.nil?
-    log_info("No location_id provided in create_payment_intent request — skipping Way.com lookup")
   end
 
   begin
@@ -280,24 +217,22 @@ post '/create_payment_intent' do
     end
     
     # Add metadata if provided
-    if metadata && !metadata.empty?
-      payment_intent_params[:metadata] = metadata
+    if params[:metadata] && !params[:metadata].empty?
+      payment_intent_params[:metadata] = params[:metadata]
+    end
+
+    # If stripe_payment_intent_id is provided in metadata, add transfer_data
+    stripe_payment_intent_id = params[:metadata] && params[:metadata]['stripe_payment_intent_id']
+    if stripe_payment_intent_id && !stripe_payment_intent_id.empty?
+      payment_intent_params[:transfer_data] = { destination: stripe_payment_intent_id }
     end
     
-    # Create the PaymentIntent on the connected account if stripe_account_id was resolved
-    if stripe_account_id
-      log_info("Creating PaymentIntent on connected account: #{stripe_account_id}")
-      payment_intent = Stripe::PaymentIntent.create(payment_intent_params, { stripe_account: stripe_account_id })
-    else
-      payment_intent = Stripe::PaymentIntent.create(payment_intent_params)
-    end
+    payment_intent = Stripe::PaymentIntent.create(payment_intent_params)
     
     # Update description to only contain the PaymentIntent ID
-    update_opts = stripe_account_id ? { stripe_account: stripe_account_id } : {}
     payment_intent = Stripe::PaymentIntent.update(
       payment_intent.id,
-      { description: payment_intent.id },
-      update_opts
+      description: payment_intent.id
     )
   rescue Stripe::StripeError => e
     status 402

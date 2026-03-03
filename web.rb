@@ -191,14 +191,18 @@ post '/create_payment_intent' do
     return log_info(validationError)
   end
 
+  log_info("[create_payment_intent] Incoming raw params: #{params.inspect}")
+
   begin
     # Get email from request
     customer_email = params[:email] || params[:receipt_email]
-    
+    log_info("[create_payment_intent] customer_email: #{customer_email.inspect}")
+
     # Look up or create Stripe Customer from email
     customer = nil
     if customer_email
       customer = lookupOrCreateCustomer(customer_email)
+      log_info("[create_payment_intent] customer: #{customer&.id.inspect}")
     end
     
     payment_intent_params = {
@@ -216,20 +220,54 @@ post '/create_payment_intent' do
       payment_intent_params[:customer] = customer.id
     end
     
-    # Extract stripe_account_id from metadata if provided (used for connected account routing)
+    # Extract stripe_account_id from metadata if provided (used for connected account routing).
+    # Handles both nested form params (metadata[stripe_account_id]=acct_xxx)
+    # and JSON-encoded metadata strings (metadata={"stripe_account_id":"acct_xxx"}).
     stripe_account_id = nil
+    log_info("[create_payment_intent] raw params[:metadata]: #{params[:metadata].inspect} (type: #{params[:metadata].class})")
     if params[:metadata]
-      metadata = params[:metadata].to_h
-      stripe_account_id = metadata.delete('stripe_account_id') || metadata.delete(:stripe_account_id)
+      raw_metadata = params[:metadata]
+      metadata = if raw_metadata.is_a?(Hash) || raw_metadata.respond_to?(:to_h) && !raw_metadata.is_a?(String)
+        raw_metadata.to_h.transform_keys(&:to_s)
+      elsif raw_metadata.is_a?(String)
+        begin
+          JSON.parse(raw_metadata)
+        rescue JSON::ParserError => json_err
+          log_info("[create_payment_intent] Failed to JSON.parse metadata string: #{json_err.message}")
+          {}
+        end
+      else
+        {}
+      end
+      log_info("[create_payment_intent] parsed metadata hash: #{metadata.inspect}")
+      stripe_account_id = metadata.delete('stripe_account_id')
+      log_info("[create_payment_intent] stripe_account_id extracted from metadata: #{stripe_account_id.inspect}")
+      log_info("[create_payment_intent] remaining metadata after extraction: #{metadata.inspect}")
       payment_intent_params[:metadata] = metadata unless metadata.empty?
     end
 
-    # Route to connected account if stripe_account_id was provided
-    if stripe_account_id && !stripe_account_id.empty?
-      payment_intent_params[:transfer_data] = { destination: stripe_account_id }
+    # Also allow stripe_account_id as a top-level param (fallback)
+    if (stripe_account_id.nil? || stripe_account_id.empty?) && params[:stripe_account_id]
+      stripe_account_id = params[:stripe_account_id]
+      log_info("[create_payment_intent] stripe_account_id from top-level param: #{stripe_account_id.inspect}")
     end
 
+    log_info("[create_payment_intent] final stripe_account_id: #{stripe_account_id.inspect}")
+
+    # Route to connected account via destination charge.
+    # Terminal (card_present) requires both transfer_data AND on_behalf_of.
+    if stripe_account_id && !stripe_account_id.empty?
+      payment_intent_params[:on_behalf_of] = stripe_account_id
+      payment_intent_params[:transfer_data] = { destination: stripe_account_id }
+      log_info("[create_payment_intent] routing to connected account — on_behalf_of: #{stripe_account_id}, transfer_data.destination: #{stripe_account_id}")
+    else
+      log_info("[create_payment_intent] no stripe_account_id — creating normal PaymentIntent")
+    end
+
+    log_info("[create_payment_intent] final payment_intent_params: #{payment_intent_params.inspect}")
+
     payment_intent = Stripe::PaymentIntent.create(payment_intent_params)
+    log_info("[create_payment_intent] PaymentIntent created: #{payment_intent.id}")
     
     # Update description to only contain the PaymentIntent ID
     payment_intent = Stripe::PaymentIntent.update(

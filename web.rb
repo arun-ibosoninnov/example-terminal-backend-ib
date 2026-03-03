@@ -203,7 +203,9 @@ post '/create_payment_intent' do
     if customer_email
       customer = lookupOrCreateCustomer(customer_email)
     end
-    
+
+    stripe_account_id = params[:stripe_account_id] || params['stripe_account_id']
+
     payment_intent_params = {
       :payment_method_types => params[:payment_method_types] || ['card_present'],
       :capture_method => params[:capture_method] || 'manual',
@@ -222,6 +224,12 @@ post '/create_payment_intent' do
     # Add metadata if provided
     if params[:metadata] && !params[:metadata].empty?
       payment_intent_params[:metadata] = params[:metadata]
+    end
+
+    # If a connected Stripe account is provided, route funds via transfer_data destination
+    if stripe_account_id && !stripe_account_id.strip.empty?
+      payment_intent_params[:transfer_data] = { destination: stripe_account_id.strip }
+      log_info("Stripe Connect: routing payment to connected account #{stripe_account_id}")
     end
     
     payment_intent = Stripe::PaymentIntent.create(payment_intent_params)

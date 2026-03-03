@@ -216,11 +216,19 @@ post '/create_payment_intent' do
       payment_intent_params[:customer] = customer.id
     end
     
-    # Add metadata if provided
-    if params[:metadata] && !params[:metadata].empty?
-      payment_intent_params[:metadata] = params[:metadata]
+    # Extract stripe_account_id from metadata if provided (used for connected account routing)
+    stripe_account_id = nil
+    if params[:metadata]
+      metadata = params[:metadata].to_h
+      stripe_account_id = metadata.delete('stripe_account_id') || metadata.delete(:stripe_account_id)
+      payment_intent_params[:metadata] = metadata unless metadata.empty?
     end
-    
+
+    # Route to connected account if stripe_account_id was provided
+    if stripe_account_id && !stripe_account_id.empty?
+      payment_intent_params[:transfer_data] = { destination: stripe_account_id }
+    end
+
     payment_intent = Stripe::PaymentIntent.create(payment_intent_params)
     
     # Update description to only contain the PaymentIntent ID

@@ -494,5 +494,8 @@ end
 # Explicitly start the server when run directly (e.g. ruby web.rb).
 # Required for Render/Heroku/Railway so the process binds to PORT and doesn't exit immediately.
 if __FILE__ == $PROGRAM_NAME
-  run!(port: settings.port, host: settings.bind)
+  Sinatra::Application.run!(
+    port: Sinatra::Application.settings.port,
+    host: Sinatra::Application.settings.bind
+  )
 end

@@ -3,11 +3,9 @@ GEM
   specs:
     dotenv (2.8.1)
     json (2.6.2)
-    logger (1.7.0)
     mustermann (3.0.0)
       ruby2_keywords (~> 0.0.1)
     nio4r (2.7.5)
-    ostruct (0.6.3)
     puma (7.2.0)
       nio4r (~> 2.0)
     rack (2.2.6.4)
@@ -31,8 +29,6 @@ PLATFORMS
 DEPENDENCIES
   dotenv
   json
-  logger
-  ostruct
   puma (>= 6.4)
   rack-protection
   sinatra

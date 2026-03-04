@@ -2,11 +2,6 @@
 # We'll configure the port and bind address directly in code
 ARGV.clear if ARGV.any?
 
-# Explicitly require gems that will be removed from Ruby's default stdlib in Ruby 4.0,
-# ensuring the installed gem version is loaded before rack or stripe can trigger the warning.
-require 'logger'
-require 'ostruct'
-
 require 'sinatra'
 require 'stripe'
 require 'dotenv'
@@ -88,7 +83,6 @@ end
 
 def log_info(message)
   puts "\n#{message}\n\n"
-  message
 end
 
 # Returns the HTTP status from a Stripe error, falling back to 402.

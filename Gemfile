@@ -1,9 +1,11 @@
 source "https://rubygems.org"
 
-ruby "3.4.8"
+ruby "~> 3.4"
 
 gem 'dotenv'
 gem 'json'
+gem 'logger'
+gem 'ostruct'
 gem 'rack-protection'
 gem 'sinatra'
 gem 'sinatra-cross_origin'

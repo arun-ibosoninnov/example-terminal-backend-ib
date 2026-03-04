@@ -40,17 +40,29 @@ end
 # Security: Enable protection against common attacks
 configure do
   enable :cross_origin
-  enable :sessions
-  set :protection, :except => [:json_csrf] # CORS handles cross-origin for API
+  set :protection, :except => [:json_csrf]
 end
 
-# CORS Configuration - Allow all origins
+# CORS and Security Headers
 before do
-  response.headers['Access-Control-Allow-Origin'] = '*'
+  # In production, restrict CORS to ALLOWED_ORIGINS if set; otherwise allow all (dev/staging)
+  if PRODUCTION && ENV['ALLOWED_ORIGINS'] && !ENV['ALLOWED_ORIGINS'].strip.empty?
+    allowed = ENV['ALLOWED_ORIGINS'].split(',').map(&:strip)
+    origin = request.env['HTTP_ORIGIN']
+    if origin && allowed.include?(origin)
+      response.headers['Access-Control-Allow-Origin'] = origin
+      response.headers['Vary'] = 'Origin'
+    elsif !allowed.empty?
+      response.headers['Access-Control-Allow-Origin'] = allowed.first
+    end
+  else
+    response.headers['Access-Control-Allow-Origin'] = '*'
+  end
+
   response.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
   response.headers['Access-Control-Allow-Headers'] = 'Authorization, Content-Type, Accept'
   response.headers['Access-Control-Max-Age'] = '3600'
-  
+
   # Security headers
   response.headers['X-Content-Type-Options'] = 'nosniff'
   response.headers['X-Frame-Options'] = 'DENY'
@@ -58,6 +70,8 @@ before do
   if PRODUCTION
     response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
   end
+
+  content_type :json
 end
 
 options "*" do
@@ -68,14 +82,18 @@ options "*" do
 end
 
 def log_info(message)
-  puts "\n" + message + "\n\n"
-  return message
+  puts "\n#{message}\n\n"
+  message
+end
+
+# Returns the HTTP status from a Stripe error, falling back to 402.
+def stripe_error_status(e)
+  e.respond_to?(:http_status) && e.http_status ? e.http_status : 402
 end
 
 get '/' do
   status 404
-  content_type :json
-  {:error => 'Not Found', :message => 'This service is not available.'}.to_json
+  { error: 'Not Found', message: 'This service is not available.' }.to_json
 end
 
 def validateApiKey
@@ -106,31 +124,31 @@ end
 # This endpoint registers a Verifone P400 reader to your Stripe account.
 # https://stripe.com/docs/terminal/readers/connecting/verifone-p400#register-reader
 post '/register_reader' do
-  validationError = validateApiKey
-  if !validationError.nil?
+  validation_error = validateApiKey
+  unless validation_error.nil?
     status 400
-    return log_info(validationError)
+    return { error: validation_error }.to_json
   end
 
   begin
     reader = Stripe::Terminal::Reader.create(
-      :registration_code => params[:registration_code],
-      :label => params[:label],
-      :location => params[:location]
+      registration_code: params[:registration_code],
+      label:             params[:label],
+      location:          params[:location]
     )
   rescue Stripe::StripeError => e
-    status 402
-    return log_info("Error registering reader! #{e.message}")
+    log_info("Error registering reader! #{e.message}")
+    status stripe_error_status(e)
+    return { error: e.message }.to_json
   end
 
   log_info("Reader registered: #{reader.id}")
-
   status 200
   # Note that returning the Stripe reader object directly creates a dependency between your
   # backend's Stripe.api_version and your clients, making future upgrades more complicated.
   # All clients must also be ready for backwards-compatible changes at any time:
   # https://stripe.com/docs/upgrades#what-changes-does-stripe-consider-to-be-backwards-compatible
-  return reader.to_json
+  reader.to_json
 end
 
 # This endpoint creates a ConnectionToken, which gives the SDK permission
@@ -143,22 +161,39 @@ end
 # To create a ConnectionToken for a connected account, see
 # https://stripe.com/docs/terminal/features/connect#direct-connection-tokens
 post '/connection_token' do
-  validationError = validateApiKey
-  if !validationError.nil?
+  validation_error = validateApiKey
+  unless validation_error.nil?
     status 400
-    return log_info(validationError)
+    return { error: validation_error }.to_json
   end
 
   begin
     token = Stripe::Terminal::ConnectionToken.create
   rescue Stripe::StripeError => e
-    status 402
-    return log_info("Error creating ConnectionToken! #{e.message}")
+    log_info("Error creating ConnectionToken! #{e.message}")
+    status stripe_error_status(e)
+    return { error: e.message }.to_json
   end
 
-  content_type :json
   status 200
-  return {:secret => token.secret}.to_json
+  { secret: token.secret }.to_json
+end
+
+# Looks up or creates a Customer on your Stripe account with the provided email.
+def lookupOrCreateCustomer(customerEmail)
+  return nil if customerEmail.nil? || customerEmail.empty?
+
+  begin
+    customer_list = Stripe::Customer.list(email: customerEmail, limit: 1).data
+    if customer_list.length == 1
+      customer_list[0]
+    else
+      Stripe::Customer.create(email: customerEmail)
+    end
+  rescue Stripe::StripeError => e
+    log_info("Error creating or retrieving customer! #{e.message}")
+    nil
+  end
 end
 
 # This endpoint creates a PaymentIntent.
@@ -167,206 +202,206 @@ end
 # The example backend does not currently support connected accounts.
 # To create a PaymentIntent for a connected account, see
 # https://stripe.com/docs/terminal/features/connect#direct-payment-intents-server-side
-# Looks up or creates a Customer on your stripe account with the provided email
-def lookupOrCreateCustomer(customerEmail)
-  return nil if customerEmail.nil? || customerEmail.empty?
-  
-  begin
-    customerList = Stripe::Customer.list(email: customerEmail, limit: 1).data
-    if (customerList.length == 1)
-      return customerList[0]
-    else
-      return Stripe::Customer.create(email: customerEmail)
-    end
-  rescue Stripe::StripeError => e
-    log_info("Error creating or retrieving customer! #{e.message}")
-    return nil
-  end
-end
-
 post '/create_payment_intent' do
-  # Log all received data from the triggering call
-  log_info("=== create_payment_intent triggered ===\nFull received params: #{params.inspect}\nRaw request body: #{request.body.read rescue 'N/A'}\nLocation ID: #{params[:location_id] || params['location_id'] || 'not provided'}\nOrder ID: #{params[:order_id] || params['order_id'] || 'not provided'}\nTags: #{params[:tags] || params['tags'] || 'not provided'}\nAll param keys: #{params.keys.inspect}")
+  log_info("=== create_payment_intent triggered — amount: #{params[:amount]}, currency: #{params[:currency] || 'usd'} ===")
 
-  validationError = validateApiKey
-  if !validationError.nil?
+  validation_error = validateApiKey
+  unless validation_error.nil?
     status 400
-    return log_info(validationError)
+    return { error: validation_error }.to_json
+  end
+
+  # Validate required fields before hitting Stripe
+  if params[:amount].nil? || params[:amount].to_s.strip.empty? || params[:amount].to_i <= 0
+    status 400
+    return { error: "'amount' is required and must be a positive integer (smallest currency unit, e.g. cents)" }.to_json
   end
 
   begin
-    # Get email from request
     customer_email = params[:email] || params[:receipt_email]
-    
-    # Look up or create Stripe Customer from email
-    customer = nil
-    if customer_email
-      customer = lookupOrCreateCustomer(customer_email)
-    end
+    customer = lookupOrCreateCustomer(customer_email) if customer_email
 
     stripe_account_id = params[:stripe_account_id] || params['stripe_account_id']
 
     payment_intent_params = {
-      :payment_method_types => params[:payment_method_types] || ['card_present'],
-      :capture_method => params[:capture_method] || 'manual',
-      :amount => params[:amount],
-      :currency => params[:currency] || 'usd',
-      :description => params[:description] || 'Example PaymentIntent',
-      :payment_method_options => params[:payment_method_options] || [],
-      :receipt_email => customer_email,
+      payment_method_types: params[:payment_method_types] || ['card_present'],
+      capture_method:       params[:capture_method] || 'manual',
+      amount:               params[:amount].to_i,
+      currency:             params[:currency] || 'usd',
+      description:          params[:description] || 'Stripe Terminal Payment',
+      receipt_email:        customer_email,
     }
-    
-    # Add customer if we have one
-    if customer
-      payment_intent_params[:customer] = customer.id
-    end
-    
-    # Add metadata if provided
+
+    payment_intent_params[:customer] = customer.id if customer
+
     if params[:metadata] && !params[:metadata].empty?
       payment_intent_params[:metadata] = params[:metadata]
     end
 
-    # If a connected Stripe account is provided, route funds via transfer_data destination
+    # Only forward payment_method_options when explicitly provided
+    if params[:payment_method_options] && !params[:payment_method_options].empty?
+      payment_intent_params[:payment_method_options] = params[:payment_method_options]
+    end
+
+    # Route funds to a connected Stripe account when provided
     if stripe_account_id && !stripe_account_id.strip.empty?
       payment_intent_params[:transfer_data] = { destination: stripe_account_id.strip }
       log_info("Stripe Connect: routing payment to connected account #{stripe_account_id}")
     end
-    
+
     payment_intent = Stripe::PaymentIntent.create(payment_intent_params)
-    
-    # Update description to only contain the PaymentIntent ID
-    payment_intent = Stripe::PaymentIntent.update(
-      payment_intent.id,
-      description: payment_intent.id
-    )
   rescue Stripe::StripeError => e
-    status 402
-    return log_info("Error creating PaymentIntent! #{e.message}")
+    log_info("Error creating PaymentIntent! #{e.message}")
+    status stripe_error_status(e)
+    return { error: e.message }.to_json
   end
 
   log_info("PaymentIntent successfully created: #{payment_intent.id}")
   status 200
-  return {:intent => payment_intent.id, :secret => payment_intent.client_secret}.to_json
+  { intent: payment_intent.id, secret: payment_intent.client_secret }.to_json
 end
 
 # This endpoint captures a PaymentIntent.
 # https://stripe.com/docs/terminal/payments#capture
 post '/capture_payment_intent' do
+  validation_error = validateApiKey
+  unless validation_error.nil?
+    status 400
+    return { error: validation_error }.to_json
+  end
+
   begin
     id = params["payment_intent_id"]
     if !params["amount_to_capture"].nil?
-      payment_intent = Stripe::PaymentIntent.capture(id, :amount_to_capture => params["amount_to_capture"])
+      payment_intent = Stripe::PaymentIntent.capture(id, amount_to_capture: params["amount_to_capture"].to_i)
     else
       payment_intent = Stripe::PaymentIntent.capture(id)
     end
   rescue Stripe::StripeError => e
-    status 402
-    return log_info("Error capturing PaymentIntent! #{e.message}")
+    log_info("Error capturing PaymentIntent! #{e.message}")
+    status stripe_error_status(e)
+    return { error: e.message }.to_json
   end
 
   log_info("PaymentIntent successfully captured: #{id}")
-  # Optionally reconcile the PaymentIntent with your internal order system.
   status 200
-  return {:intent => payment_intent.id, :secret => payment_intent.client_secret}.to_json
+  { intent: payment_intent.id, secret: payment_intent.client_secret }.to_json
 end
 
 # This endpoint cancels a PaymentIntent.
 # https://stripe.com/docs/api/payment_intents/cancel
 post '/cancel_payment_intent' do
+  validation_error = validateApiKey
+  unless validation_error.nil?
+    status 400
+    return { error: validation_error }.to_json
+  end
+
   begin
     id = params["payment_intent_id"]
     payment_intent = Stripe::PaymentIntent.cancel(id)
   rescue Stripe::StripeError => e
-    status 402
-    return log_info("Error canceling PaymentIntent! #{e.message}")
+    log_info("Error canceling PaymentIntent! #{e.message}")
+    status stripe_error_status(e)
+    return { error: e.message }.to_json
   end
 
   log_info("PaymentIntent successfully canceled: #{id}")
-  # Optionally reconcile the PaymentIntent with your internal order system.
   status 200
-  return {:intent => payment_intent.id, :secret => payment_intent.client_secret}.to_json
+  { intent: payment_intent.id, secret: payment_intent.client_secret }.to_json
 end
 
 # This endpoint creates a SetupIntent.
 # https://stripe.com/docs/api/setup_intents/create
 post '/create_setup_intent' do
-  validationError = validateApiKey
-  if !validationError.nil?
+  validation_error = validateApiKey
+  unless validation_error.nil?
     status 400
-    return log_info(validationError)
+    return { error: validation_error }.to_json
   end
 
   begin
     setup_intent_params = {
-      :payment_method_types => params[:payment_method_types] || ['card_present'],
+      payment_method_types: params[:payment_method_types] || ['card_present'],
     }
 
-    if !params[:customer].nil?
-      setup_intent_params[:customer] = params[:customer]
-    end
-
-    if !params[:description].nil?
-      setup_intent_params[:description] = params[:description]
-    end
-
-    if !params[:on_behalf_of].nil?
-      setup_intent_params[:on_behalf_of] = params[:on_behalf_of]
-    end
+    setup_intent_params[:customer]     = params[:customer]     unless params[:customer].nil?
+    setup_intent_params[:description]  = params[:description]  unless params[:description].nil?
+    setup_intent_params[:on_behalf_of] = params[:on_behalf_of] unless params[:on_behalf_of].nil?
 
     setup_intent = Stripe::SetupIntent.create(setup_intent_params)
-
   rescue Stripe::StripeError => e
-    status 402
-    return log_info("Error creating SetupIntent! #{e.message}")
+    log_info("Error creating SetupIntent! #{e.message}")
+    status stripe_error_status(e)
+    return { error: e.message }.to_json
   end
 
   log_info("SetupIntent successfully created: #{setup_intent.id}")
   status 200
-  return {:intent => setup_intent.id, :secret => setup_intent.client_secret}.to_json
+  { intent: setup_intent.id, secret: setup_intent.client_secret }.to_json
 end
 
 # Looks up or creates a Customer on your stripe account
-# with email "example@test.com".
+# with email "example@test.com". Used as a fallback when no customer_id or email is provided.
 def lookupOrCreateExampleCustomer
   customerEmail = "example@test.com"
   begin
-    customerList = Stripe::Customer.list(email: customerEmail, limit: 1).data
-    if (customerList.length == 1)
-      return customerList[0]
+    customer_list = Stripe::Customer.list(email: customerEmail, limit: 1).data
+    if customer_list.length == 1
+      customer_list[0]
     else
-      return Stripe::Customer.create(email: customerEmail)
+      Stripe::Customer.create(email: customerEmail)
     end
   rescue Stripe::StripeError => e
-    status 402
-    return log_info("Error creating or retreiving customer! #{e.message}")
+    log_info("Error creating or retrieving customer! #{e.message}")
+    nil
   end
 end
 
 # This endpoint attaches a PaymentMethod to a Customer.
 # https://stripe.com/docs/terminal/payments/saving-cards#read-reusable-card
+# Accepts: payment_method_id (required), customer_id or email (optional; falls back to example customer)
 post '/attach_payment_method_to_customer' do
+  validation_error = validateApiKey
+  unless validation_error.nil?
+    status 400
+    return { error: validation_error }.to_json
+  end
+
   begin
-    customer = lookupOrCreateExampleCustomer
+    customer = if params[:customer_id] && !params[:customer_id].strip.empty?
+      Stripe::Customer.retrieve(params[:customer_id].strip)
+    elsif params[:email] && !params[:email].strip.empty?
+      lookupOrCreateCustomer(params[:email].strip)
+    else
+      lookupOrCreateExampleCustomer
+    end
+
+    if customer.nil?
+      status 400
+      return { error: "Could not find or create a customer" }.to_json
+    end
 
     payment_method = Stripe::PaymentMethod.attach(
       params[:payment_method_id],
       {
         customer: customer.id,
-        expand: ["customer"],
-    })
+        expand:   ["customer"],
+      }
+    )
   rescue Stripe::StripeError => e
-    status 402
-    return log_info("Error attaching PaymentMethod to Customer! #{e.message}")
+    log_info("Error attaching PaymentMethod to Customer! #{e.message}")
+    status stripe_error_status(e)
+    return { error: e.message }.to_json
   end
 
   log_info("Attached PaymentMethod to Customer: #{customer.id}")
-
   status 200
   # Note that returning the Stripe payment_method object directly creates a dependency between your
   # backend's Stripe.api_version and your clients, making future upgrades more complicated.
   # All clients must also be ready for backwards-compatible changes at any time:
   # https://stripe.com/docs/upgrades#what-changes-does-stripe-consider-to-be-backwards-compatible
-  return payment_method.to_json
+  payment_method.to_json
 end
 
 # This endpoint updates the PaymentIntent represented by 'payment_intent_id'.
@@ -374,29 +409,32 @@ end
 #
 # https://stripe.com/docs/api/payment_intents/update
 post '/update_payment_intent' do
-  payment_intent_id = params["payment_intent_id"]
-  if payment_intent_id.nil?
+  validation_error = validateApiKey
+  unless validation_error.nil?
     status 400
-    return log_info("'payment_intent_id' is a required parameter")
+    return { error: validation_error }.to_json
+  end
+
+  payment_intent_id = params["payment_intent_id"]
+  if payment_intent_id.nil? || payment_intent_id.strip.empty?
+    status 400
+    return { error: "'payment_intent_id' is a required parameter" }.to_json
   end
 
   begin
     allowed_keys = ["receipt_email"]
     update_params = params.select { |k, _| allowed_keys.include?(k) }
 
-    payment_intent = Stripe::PaymentIntent.update(
-      payment_intent_id,
-      update_params
-    )
-
+    payment_intent = Stripe::PaymentIntent.update(payment_intent_id, update_params)
     log_info("Updated PaymentIntent #{payment_intent_id}")
   rescue Stripe::StripeError => e
-    status 402
-    return log_info("Error updating PaymentIntent #{payment_intent_id}. #{e.message}")
+    log_info("Error updating PaymentIntent #{payment_intent_id}. #{e.message}")
+    status stripe_error_status(e)
+    return { error: e.message }.to_json
   end
 
   status 200
-  return {:intent => payment_intent.id, :secret => payment_intent.client_secret}.to_json
+  { intent: payment_intent.id, secret: payment_intent.client_secret }.to_json
 end
 
 # This endpoint lists the first 100 Locations. If you will have more than 100
@@ -404,50 +442,46 @@ end
 # you can efficiently fetch Locations as needed.
 # https://stripe.com/docs/api/terminal/locations
 get '/list_locations' do
-  validationError = validateApiKey
-  if !validationError.nil?
+  validation_error = validateApiKey
+  unless validation_error.nil?
     status 400
-    return log_info(validationError)
+    return { error: validation_error }.to_json
   end
 
   begin
-    locations = Stripe::Terminal::Location.list(
-      limit: 100
-    )
+    locations = Stripe::Terminal::Location.list(limit: 100)
   rescue Stripe::StripeError => e
-    status 402
-    return log_info("Error fetching Locations! #{e.message}")
+    log_info("Error fetching Locations! #{e.message}")
+    status stripe_error_status(e)
+    return { error: e.message }.to_json
   end
 
   log_info("#{locations.data.size} Locations successfully fetched")
-
   status 200
-  content_type :json
-  return locations.data.to_json
+  locations.data.to_json
 end
 
 # This endpoint creates a Location.
 # https://stripe.com/docs/api/terminal/locations
 post '/create_location' do
-  validationError = validateApiKey
-  if !validationError.nil?
+  validation_error = validateApiKey
+  unless validation_error.nil?
     status 400
-    return log_info(validationError)
+    return { error: validation_error }.to_json
   end
 
   begin
     location = Stripe::Terminal::Location.create(
       display_name: params[:display_name],
-      address: params[:address]
+      address:      params[:address]
     )
   rescue Stripe::StripeError => e
-    status 402
-    return log_info("Error creating Location! #{e.message}")
+    log_info("Error creating Location! #{e.message}")
+    status stripe_error_status(e)
+    return { error: e.message }.to_json
   end
 
   log_info("Location successfully created: #{location.id}")
-
   status 200
-  content_type :json
-  return location.to_json
+  location.to_json
 end

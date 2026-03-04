@@ -5,7 +5,7 @@ version: 2.1
 jobs:
   push:
     docker:
-      - image: circleci/buildpack-deps:stretch
+      - image: cimg/ruby:3.4
     steps:
       - checkout
       - setup_remote_docker

@@ -490,3 +490,9 @@ post '/create_location' do
   status 200
   location.to_json
 end
+
+# Explicitly start the server when run directly (e.g. ruby web.rb).
+# Required for Render/Heroku/Railway so the process binds to PORT and doesn't exit immediately.
+if __FILE__ == $PROGRAM_NAME
+  run!(port: settings.port, host: settings.bind)
+end

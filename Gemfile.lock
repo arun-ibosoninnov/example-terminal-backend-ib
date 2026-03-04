@@ -6,9 +6,9 @@ GEM
     logger (1.7.0)
     mustermann (3.0.0)
       ruby2_keywords (~> 0.0.1)
-    nio4r (2.5.9)
+    nio4r (2.7.5)
     ostruct (0.6.3)
-    puma (6.3.1)
+    puma (7.2.0)
       nio4r (~> 2.0)
     rack (2.2.6.4)
     rack-protection (3.0.4)
@@ -33,7 +33,7 @@ DEPENDENCIES
   json
   logger
   ostruct
-  puma
+  puma (>= 6.4)
   rack-protection
   sinatra
   sinatra-cross_origin

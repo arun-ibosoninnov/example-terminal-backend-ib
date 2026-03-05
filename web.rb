@@ -2,12 +2,19 @@
 # We'll configure the port and bind address directly in code
 ARGV.clear if ARGV.any?
 
+require 'logger'
 require 'sinatra'
 require 'stripe'
 require 'dotenv'
 require 'json'
 require 'sinatra/cross_origin'
 require 'rack/protection'
+
+# Logger for production; defaults to stderr, level from LOG_LEVEL (default INFO).
+APP_LOGGER = Logger.new($stderr).tap do |l|
+  l.level = Logger.const_get((ENV['LOG_LEVEL'] || 'INFO').upcase) rescue Logger::INFO
+  l.formatter = proc { |sev, _dt, _prog, msg| "[#{sev}] #{msg}\n" }
+end
 
 # Set the port from environment variable or default to 4567
 # This ensures compatibility with Railway, Render, Heroku, and other platforms
@@ -33,7 +40,7 @@ Stripe.api_version = '2020-03-02'
 # Production Configuration Validation
 if PRODUCTION
   if Stripe.api_key.nil? || Stripe.api_key.empty? || !Stripe.api_key.start_with?('sk_live')
-    puts "\n⚠️  WARNING: STRIPE_SECRET_KEY should be set to your live key (sk_live_...) in production!\n\n"
+    APP_LOGGER.warn("STRIPE_SECRET_KEY should be set to your live key (sk_live_...) in production!")
   end
 end
 
@@ -82,7 +89,7 @@ options "*" do
 end
 
 def log_info(message)
-  puts "\n#{message}\n\n"
+  APP_LOGGER.info(message.to_s)
 end
 
 # Returns the HTTP status from a Stripe error, falling back to 402.
@@ -95,7 +102,8 @@ get '/' do
   { error: 'Not Found', message: 'This service is not available.' }.to_json
 end
 
-def validateApiKey
+# Returns API key validation error message, or nil if valid. Used by require_valid_api_key!
+def validate_api_key
   if Stripe.api_key.nil? || Stripe.api_key.empty?
     mode = STRIPE_ENV == 'production' ? 'production' : 'test'
     return "Error: you provided an empty secret key. Please provide your #{mode} mode secret key. For more information, see https://stripe.com/docs/keys"
@@ -103,13 +111,11 @@ def validateApiKey
   if Stripe.api_key.start_with?('pk')
     return "Error: you used a publishable key to set up the backend. Please use your secret key. For more information, see https://stripe.com/docs/keys"
   end
-  # Production validation: ensure key matches environment
   if STRIPE_ENV == 'production'
     unless Stripe.api_key.start_with?('sk_live')
       return "Error: you are in production mode but using a test key. Please use your live mode secret key (sk_live_...). For more information, see https://stripe.com/docs/keys#test-live-modes"
     end
   else
-    # Test mode: ensure key matches environment
     if Stripe.api_key.start_with?('sk_live')
       return "Error: you are in test mode but using a live key. Please use your test mode secret key (sk_test_...). For more information, see https://stripe.com/docs/keys#test-live-modes"
     end
@@ -117,16 +123,22 @@ def validateApiKey
       return "Error: invalid secret key format. Please use your test mode secret key (sk_test_...). For more information, see https://stripe.com/docs/keys"
     end
   end
-  return nil
+  nil
+end
+
+# Shared API-key validation: halts with 400 if invalid. Call at the start of protected routes.
+def require_valid_api_key!
+  err = validate_api_key
+  halt 400, { error: err }.to_json if err
 end
 
 # This endpoint registers a Verifone P400 reader to your Stripe account.
 # https://stripe.com/docs/terminal/readers/connecting/verifone-p400#register-reader
 post '/register_reader' do
-  validation_error = validateApiKey
-  unless validation_error.nil?
+  require_valid_api_key!
+  if params[:registration_code].nil? || params[:registration_code].to_s.strip.empty?
     status 400
-    return { error: validation_error }.to_json
+    return { error: "'registration_code' is required to register a reader. For more information, see https://stripe.com/docs/terminal/readers/connecting" }.to_json
   end
 
   begin
@@ -160,11 +172,7 @@ end
 # To create a ConnectionToken for a connected account, see
 # https://stripe.com/docs/terminal/features/connect#direct-connection-tokens
 post '/connection_token' do
-  validation_error = validateApiKey
-  unless validation_error.nil?
-    status 400
-    return { error: validation_error }.to_json
-  end
+  require_valid_api_key!
 
   begin
     token = Stripe::Terminal::ConnectionToken.create
@@ -179,15 +187,15 @@ post '/connection_token' do
 end
 
 # Looks up or creates a Customer on your Stripe account with the provided email.
-def lookupOrCreateCustomer(customerEmail)
-  return nil if customerEmail.nil? || customerEmail.empty?
+def lookup_or_create_customer(customer_email)
+  return nil if customer_email.nil? || customer_email.to_s.strip.empty?
 
   begin
-    customer_list = Stripe::Customer.list(email: customerEmail, limit: 1).data
+    customer_list = Stripe::Customer.list(email: customer_email, limit: 1).data
     if customer_list.length == 1
       customer_list[0]
     else
-      Stripe::Customer.create(email: customerEmail)
+      Stripe::Customer.create(email: customer_email)
     end
   rescue Stripe::StripeError => e
     log_info("Error creating or retrieving customer! #{e.message}")
@@ -204,11 +212,7 @@ end
 post '/create_payment_intent' do
   log_info("=== create_payment_intent triggered — amount: #{params[:amount]}, currency: #{params[:currency] || 'usd'} ===")
 
-  validation_error = validateApiKey
-  unless validation_error.nil?
-    status 400
-    return { error: validation_error }.to_json
-  end
+  require_valid_api_key!
 
   # Validate required fields before hitting Stripe
   if params[:amount].nil? || params[:amount].to_s.strip.empty? || params[:amount].to_i <= 0
@@ -218,7 +222,7 @@ post '/create_payment_intent' do
 
   begin
     customer_email = params[:email] || params[:receipt_email]
-    customer = lookupOrCreateCustomer(customer_email) if customer_email
+    customer = lookup_or_create_customer(customer_email) if customer_email
 
     stripe_account_id = params[:stripe_account_id] || params['stripe_account_id']
 
@@ -263,15 +267,15 @@ end
 # This endpoint captures a PaymentIntent.
 # https://stripe.com/docs/terminal/payments#capture
 post '/capture_payment_intent' do
-  validation_error = validateApiKey
-  unless validation_error.nil?
+  require_valid_api_key!
+  id = params["payment_intent_id"] || params[:payment_intent_id]
+  if id.nil? || id.to_s.strip.empty?
     status 400
-    return { error: validation_error }.to_json
+    return { error: "'payment_intent_id' is required" }.to_json
   end
 
   begin
-    id = params["payment_intent_id"]
-    if !params["amount_to_capture"].nil?
+    if !params["amount_to_capture"].nil? && !params["amount_to_capture"].to_s.strip.empty?
       payment_intent = Stripe::PaymentIntent.capture(id, amount_to_capture: params["amount_to_capture"].to_i)
     else
       payment_intent = Stripe::PaymentIntent.capture(id)
@@ -290,14 +294,14 @@ end
 # This endpoint cancels a PaymentIntent.
 # https://stripe.com/docs/api/payment_intents/cancel
 post '/cancel_payment_intent' do
-  validation_error = validateApiKey
-  unless validation_error.nil?
+  require_valid_api_key!
+  id = params["payment_intent_id"] || params[:payment_intent_id]
+  if id.nil? || id.to_s.strip.empty?
     status 400
-    return { error: validation_error }.to_json
+    return { error: "'payment_intent_id' is required" }.to_json
   end
 
   begin
-    id = params["payment_intent_id"]
     payment_intent = Stripe::PaymentIntent.cancel(id)
   rescue Stripe::StripeError => e
     log_info("Error canceling PaymentIntent! #{e.message}")
@@ -313,11 +317,7 @@ end
 # This endpoint creates a SetupIntent.
 # https://stripe.com/docs/api/setup_intents/create
 post '/create_setup_intent' do
-  validation_error = validateApiKey
-  unless validation_error.nil?
-    status 400
-    return { error: validation_error }.to_json
-  end
+  require_valid_api_key!
 
   begin
     setup_intent_params = {
@@ -340,16 +340,16 @@ post '/create_setup_intent' do
   { intent: setup_intent.id, secret: setup_intent.client_secret }.to_json
 end
 
-# Looks up or creates a Customer on your stripe account
-# with email "example@test.com". Used as a fallback when no customer_id or email is provided.
-def lookupOrCreateExampleCustomer
-  customerEmail = "example@test.com"
+# Looks up or creates a Customer on your Stripe account with email "example@test.com".
+# Used as a fallback when no customer_id or email is provided.
+def lookup_or_create_example_customer
+  example_email = "example@test.com"
   begin
-    customer_list = Stripe::Customer.list(email: customerEmail, limit: 1).data
+    customer_list = Stripe::Customer.list(email: example_email, limit: 1).data
     if customer_list.length == 1
       customer_list[0]
     else
-      Stripe::Customer.create(email: customerEmail)
+      Stripe::Customer.create(email: example_email)
     end
   rescue Stripe::StripeError => e
     log_info("Error creating or retrieving customer! #{e.message}")
@@ -361,19 +361,20 @@ end
 # https://stripe.com/docs/terminal/payments/saving-cards#read-reusable-card
 # Accepts: payment_method_id (required), customer_id or email (optional; falls back to example customer)
 post '/attach_payment_method_to_customer' do
-  validation_error = validateApiKey
-  unless validation_error.nil?
+  require_valid_api_key!
+  pm_id = params[:payment_method_id] || params["payment_method_id"]
+  if pm_id.nil? || pm_id.to_s.strip.empty?
     status 400
-    return { error: validation_error }.to_json
+    return { error: "'payment_method_id' is required" }.to_json
   end
 
   begin
-    customer = if params[:customer_id] && !params[:customer_id].strip.empty?
-      Stripe::Customer.retrieve(params[:customer_id].strip)
-    elsif params[:email] && !params[:email].strip.empty?
-      lookupOrCreateCustomer(params[:email].strip)
+    customer = if params[:customer_id] && !params[:customer_id].to_s.strip.empty?
+      Stripe::Customer.retrieve(params[:customer_id].to_s.strip)
+    elsif params[:email] && !params[:email].to_s.strip.empty?
+      lookup_or_create_customer(params[:email].to_s.strip)
     else
-      lookupOrCreateExampleCustomer
+      lookup_or_create_example_customer
     end
 
     if customer.nil?
@@ -382,7 +383,7 @@ post '/attach_payment_method_to_customer' do
     end
 
     payment_method = Stripe::PaymentMethod.attach(
-      params[:payment_method_id],
+      pm_id,
       {
         customer: customer.id,
         expand:   ["customer"],
@@ -408,14 +409,10 @@ end
 #
 # https://stripe.com/docs/api/payment_intents/update
 post '/update_payment_intent' do
-  validation_error = validateApiKey
-  unless validation_error.nil?
-    status 400
-    return { error: validation_error }.to_json
-  end
+  require_valid_api_key!
 
-  payment_intent_id = params["payment_intent_id"]
-  if payment_intent_id.nil? || payment_intent_id.strip.empty?
+  payment_intent_id = params["payment_intent_id"] || params[:payment_intent_id]
+  if payment_intent_id.nil? || payment_intent_id.to_s.strip.empty?
     status 400
     return { error: "'payment_intent_id' is a required parameter" }.to_json
   end
@@ -441,11 +438,7 @@ end
 # you can efficiently fetch Locations as needed.
 # https://stripe.com/docs/api/terminal/locations
 get '/list_locations' do
-  validation_error = validateApiKey
-  unless validation_error.nil?
-    status 400
-    return { error: validation_error }.to_json
-  end
+  require_valid_api_key!
 
   begin
     locations = Stripe::Terminal::Location.list(limit: 100)
@@ -463,16 +456,17 @@ end
 # This endpoint creates a Location.
 # https://stripe.com/docs/api/terminal/locations
 post '/create_location' do
-  validation_error = validateApiKey
-  unless validation_error.nil?
+  require_valid_api_key!
+  display_name = params[:display_name] || params["display_name"]
+  if display_name.nil? || display_name.to_s.strip.empty?
     status 400
-    return { error: validation_error }.to_json
+    return { error: "'display_name' is required to create a location. For more information, see https://stripe.com/docs/api/terminal/locations" }.to_json
   end
 
   begin
     location = Stripe::Terminal::Location.create(
-      display_name: params[:display_name],
-      address:      params[:address]
+      display_name: display_name.to_s.strip,
+      address:      params[:address] || params["address"]
     )
   rescue Stripe::StripeError => e
     log_info("Error creating Location! #{e.message}")
@@ -483,6 +477,19 @@ post '/create_location' do
   log_info("Location successfully created: #{location.id}")
   status 200
   location.to_json
+end
+
+# Global error handler: log unhandled exceptions and return a safe response.
+error do
+  err = env['sinatra.error']
+  APP_LOGGER.error("#{err.class}: #{err.message}")
+  APP_LOGGER.error(err.backtrace&.first(10)&.join("\n"))
+  if PRODUCTION
+    status 500
+    { error: 'An unexpected error occurred. Please try again later.' }.to_json
+  else
+    raise err
+  end
 end
 
 # Explicitly start the server when run directly (e.g. ruby web.rb).
